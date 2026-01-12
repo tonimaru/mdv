@@ -12,7 +12,7 @@ use axum::{
 use chrono::{DateTime, Local};
 use clap::Parser;
 use futures::stream::Stream;
-use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Config, PollWatcher, RecursiveMode, Watcher};
 use pulldown_cmark::{html, Options, Parser as MdParser};
 use std::{
     convert::Infallible,
@@ -405,7 +405,8 @@ async fn main() {
     let watch_dir = root_dir.clone();
     std::thread::spawn(move || {
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut watcher = RecommendedWatcher::new(tx, Config::default()).unwrap();
+        let config = Config::default().with_poll_interval(std::time::Duration::from_millis(500));
+        let mut watcher = PollWatcher::new(tx, config).unwrap();
         watcher.watch(&watch_dir, RecursiveMode::Recursive).unwrap();
 
         loop {
