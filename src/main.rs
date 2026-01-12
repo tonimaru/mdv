@@ -131,6 +131,26 @@ fn render_markdown(content: &str) -> String {
     html_output
 }
 
+fn contains_markdown(path: &PathBuf) -> bool {
+    if path.is_file() {
+        return path.extension().and_then(|e| e.to_str()) == Some("md");
+    }
+
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let entry_path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            if contains_markdown(&entry_path) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn validate_path(root: &PathBuf, requested_path: &str) -> Option<PathBuf> {
     let cleaned_path = requested_path.trim_start_matches('/');
     let full_path = root.join(cleaned_path);
@@ -191,8 +211,21 @@ async fn render_directory(_state: &AppState, full_path: &PathBuf, url_path: &str
                 return None;
             }
 
+            let entry_full_path = entry.path();
             let metadata = entry.metadata().ok()?;
             let is_dir = metadata.is_dir();
+
+            if is_dir {
+                if !contains_markdown(&entry_full_path) {
+                    return None;
+                }
+            } else {
+                let is_md = entry_full_path.extension().and_then(|e| e.to_str()) == Some("md");
+                if !is_md {
+                    return None;
+                }
+            }
+
             let size = if is_dir {
                 "-".to_string()
             } else {
