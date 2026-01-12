@@ -158,13 +158,20 @@ fn generate_workspace_id(path: &PathBuf) -> String {
     format!("{}-{:x}", name, hash & 0xFFFF)
 }
 
-fn generate_breadcrumbs(workspace_id: &str, path: &str) -> Vec<BreadcrumbItem> {
+fn generate_breadcrumbs(workspace_id: &str, workspace_name: &str, path: &str) -> Vec<BreadcrumbItem> {
     let base_path = format!("/view/{}", workspace_id);
-    let mut breadcrumbs = vec![BreadcrumbItem {
-        name: "root".to_string(),
-        path: base_path.clone(),
-        is_last: path.is_empty(),
-    }];
+    let mut breadcrumbs = vec![
+        BreadcrumbItem {
+            name: "root".to_string(),
+            path: "/".to_string(),
+            is_last: false,
+        },
+        BreadcrumbItem {
+            name: workspace_name.to_string(),
+            path: base_path.clone(),
+            is_last: path.is_empty(),
+        },
+    ];
 
     if !path.is_empty() {
         let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
@@ -504,7 +511,7 @@ async fn render_directory(
         _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
 
-    let breadcrumbs = generate_breadcrumbs(workspace_id, url_path);
+    let breadcrumbs = generate_breadcrumbs(workspace_id, workspace_name, url_path);
     let has_parent = !url_path.is_empty();
     let parent_path = if has_parent {
         let parts: Vec<&str> = url_path.split('/').filter(|s| !s.is_empty()).collect();
@@ -543,7 +550,7 @@ async fn render_markdown_file(
     };
 
     let html_content = render_markdown(&content);
-    let breadcrumbs = generate_breadcrumbs(workspace_id, url_path);
+    let breadcrumbs = generate_breadcrumbs(workspace_id, workspace_name, url_path);
 
     let metadata = fs::metadata(full_path).ok();
     let file_size = metadata
