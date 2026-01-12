@@ -253,13 +253,8 @@ function! mdv#sync_scroll() abort
     return
   endif
 
-  " Check if last line is visible
-  if line('w$') >= l:total
-    let l:percent = 100
-  else
-    let l:current = line('w0')
-    let l:percent = (l:current * 100) / l:total
-  endif
+  let l:current = line('.')
+  let l:percent = ((l:current - 1) * 100) / (l:total - 1)
 
   let l:url = s:base_url() . '/api/remote/scroll?percent=' . l:percent
   call s:run_silent(['curl', '-s', l:url])
