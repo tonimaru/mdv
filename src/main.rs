@@ -328,11 +328,14 @@ async fn serve_static_file(full_path: &PathBuf) -> Response {
         return (StatusCode::INTERNAL_SERVER_ERROR, Html("Failed to read file")).into_response();
     };
 
-    let mime_type = mime_guess::from_path(full_path)
-        .first_or_octet_stream()
-        .to_string();
+    let mime = mime_guess::from_path(full_path).first_or_octet_stream();
+    let content_type = if mime.type_() == "text" {
+        format!("{}; charset=utf-8", mime)
+    } else {
+        mime.to_string()
+    };
 
-    ([(header::CONTENT_TYPE, mime_type)], content).into_response()
+    ([(header::CONTENT_TYPE, content_type)], content).into_response()
 }
 
 async fn handle_raw(
