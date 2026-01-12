@@ -9,7 +9,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         Html, IntoResponse, Response,
     },
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use chrono::{DateTime, Local};
@@ -332,6 +332,22 @@ async fn api_register(
     };
 
     Json(response).into_response()
+}
+
+// API: Remove workspace
+async fn api_unregister(
+    State(state): State<AppState>,
+    Path(workspace_id): Path<String>,
+) -> Response {
+    let mut inner = state.inner.write().await;
+
+    if let Some(workspace) = inner.workspaces.remove(&workspace_id) {
+        // Drop the watcher handle to stop the file watcher thread
+        drop(workspace.watcher_handle);
+        Json(serde_json::json!({"status": "ok", "id": workspace_id})).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Workspace not found"}))).into_response()
+    }
 }
 
 // API: Get active file URL and notify browser
@@ -712,6 +728,7 @@ async fn handle_root(State(state): State<AppState>) -> Response {
 <h2>API endpoints</h2>
 <ul>
 <li>POST /api/workspace/register - Register a workspace</li>
+<li>DELETE /api/workspace/{{id}} - Remove a workspace</li>
 <li>GET /api/active?path=... - Navigate to a file</li>
 <li>GET /api/status - Server status</li>
 </ul>
@@ -741,6 +758,7 @@ async fn main() {
     let app = Router::new()
         .route("/", get(handle_root))
         .route("/api/workspace/register", post(api_register))
+        .route("/api/workspace/{id}", delete(api_unregister))
         .route("/api/active", get(api_active))
         .route("/api/status", get(api_status))
         .route("/api/remote/scroll", get(api_scroll))

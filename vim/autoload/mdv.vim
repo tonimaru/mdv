@@ -291,3 +291,112 @@ function! mdv#on_buf_enter() abort
     call mdv#active()
   endif
 endfunction
+
+" Add workspace (register with server)
+function! mdv#workspace_add(...) abort
+  if !s:ensure_server()
+    return
+  endif
+
+  let l:path = a:0 > 0 ? a:1 : s:get_project_root()
+
+  " Expand path
+  let l:path = fnamemodify(l:path, ':p')
+  if l:path[-1:] ==# '/'
+    let l:path = l:path[:-2]
+  endif
+
+  let l:url = s:base_url() . '/api/workspace/register'
+  let l:json = '{"path":"' . escape(l:path, '"') . '"}'
+
+  let l:result = system('curl -s -X POST -H "Content-Type: application/json" -d ' . shellescape(l:json) . ' ' . shellescape(l:url))
+
+  try
+    let l:resp = json_decode(l:result)
+    if has_key(l:resp, 'id')
+      let s:registered_workspaces[l:path] = l:resp
+      echo 'Workspace added: ' . l:resp.name . ' (' . l:resp.id . ')'
+    elseif has_key(l:resp, 'error')
+      echoerr 'Error: ' . l:resp.error
+    endif
+  catch
+    echoerr 'Failed to add workspace'
+  endtry
+endfunction
+
+" Remove workspace (unregister from server)
+function! mdv#workspace_remove(...) abort
+  if !mdv#is_running()
+    echo 'mdv server is not running'
+    return
+  endif
+
+  " Get workspace list
+  let l:status_url = s:base_url() . '/api/status'
+  let l:result = system('curl -s ' . shellescape(l:status_url))
+
+  try
+    let l:resp = json_decode(l:result)
+    if empty(l:resp.workspaces)
+      echo 'No workspaces registered'
+      return
+    endif
+
+    let l:workspace_id = ''
+
+    if a:0 > 0
+      " Use provided workspace id
+      let l:workspace_id = a:1
+    else
+      " Show list and let user choose
+      let l:choices = []
+      let l:idx = 1
+      for l:ws in l:resp.workspaces
+        call add(l:choices, l:idx . '. ' . l:ws.name . ' (' . l:ws.id . ') - ' . l:ws.path)
+        let l:idx += 1
+      endfor
+
+      echo 'Select workspace to remove:'
+      for l:choice in l:choices
+        echo l:choice
+      endfor
+
+      let l:input = input('Enter number (or workspace id): ')
+      if empty(l:input)
+        return
+      endif
+
+      if l:input =~# '^\d\+$'
+        let l:num = str2nr(l:input)
+        if l:num >= 1 && l:num <= len(l:resp.workspaces)
+          let l:workspace_id = l:resp.workspaces[l:num - 1].id
+        else
+          echoerr 'Invalid selection'
+          return
+        endif
+      else
+        let l:workspace_id = l:input
+      endif
+    endif
+
+    " Delete workspace
+    let l:delete_url = s:base_url() . '/api/workspace/' . l:workspace_id
+    let l:del_result = system('curl -s -X DELETE ' . shellescape(l:delete_url))
+
+    let l:del_resp = json_decode(l:del_result)
+    if has_key(l:del_resp, 'status') && l:del_resp.status ==# 'ok'
+      " Remove from local cache
+      for [l:path, l:ws] in items(s:registered_workspaces)
+        if l:ws.id ==# l:workspace_id
+          call remove(s:registered_workspaces, l:path)
+          break
+        endif
+      endfor
+      echo 'Workspace removed: ' . l:workspace_id
+    elseif has_key(l:del_resp, 'error')
+      echoerr 'Error: ' . l:del_resp.error
+    endif
+  catch
+    echoerr 'Failed to remove workspace'
+  endtry
+endfunction

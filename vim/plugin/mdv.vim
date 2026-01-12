@@ -12,6 +12,8 @@ command! MdvStop call mdv#stop()
 command! MdvOpen call mdv#open()
 command! MdvStatus call mdv#status()
 command! MdvScrollToggle call mdv#toggle_scroll()
+command! -nargs=? -complete=dir MdvWorkspaceAdd call mdv#workspace_add(<f-args>)
+command! -nargs=? MdvWorkspaceRemove call mdv#workspace_remove(<f-args>)
 
 " Autocommands for markdown files
 augroup mdv_sync
