@@ -170,6 +170,11 @@ function! mdv#active() abort
     return
   endif
 
+  " Skip if file does not exist
+  if !filereadable(l:path)
+    return
+  endif
+
   " Register workspace first
   let l:ws = mdv#register_workspace()
   if empty(l:ws)
@@ -238,6 +243,11 @@ function! mdv#sync_scroll() abort
     return
   endif
 
+  " Skip if file does not exist
+  if !filereadable(l:path)
+    return
+  endif
+
   let l:total = line('$')
   if l:total <= 1
     return
@@ -283,6 +293,11 @@ endfunction
 function! mdv#on_buf_enter() abort
   let l:path = expand('%:p')
   if l:path !~# '\.md$'
+    return
+  endif
+
+  " Skip if file does not exist
+  if !filereadable(l:path)
     return
   endif
 
