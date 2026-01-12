@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ filename }} - MDV</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.5.1/github-markdown-dark.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
+    <style>
+        body {
+            background-color: #0d1117;
+            color: #c9d1d9;
+        }
+        .header-bg {
+            background-color: #161b22;
+            border-bottom: 1px solid #30363d;
+        }
+        .container-box {
+            background-color: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+        }
+        .file-header {
+            background-color: #161b22;
+            border-bottom: 1px solid #30363d;
+            border-radius: 6px 6px 0 0;
+        }
+        .link-color {
+            color: #58a6ff;
+        }
+        .link-color:hover {
+            text-decoration: underline;
+        }
+        .breadcrumb-separator {
+            color: #8b949e;
+        }
+        .text-muted {
+            color: #8b949e;
+        }
+        .raw-button {
+            background-color: #21262d;
+            border: 1px solid #30363d;
+            color: #c9d1d9;
+            border-radius: 6px;
+            padding: 5px 16px;
+            font-size: 14px;
+        }
+        .raw-button:hover {
+            background-color: #30363d;
+        }
+        .markdown-body {
+            box-sizing: border-box;
+            min-width: 200px;
+            max-width: 100%;
+            padding: 45px;
+            background-color: #0d1117;
+        }
+        .markdown-body pre {
+            background-color: #161b22;
+        }
+        .markdown-body code {
+            background-color: rgba(110,118,129,0.4);
+        }
+        .markdown-body pre code {
+            background-color: transparent;
+        }
+        @media (max-width: 767px) {
+            .markdown-body {
+                padding: 15px;
+            }
+        }
+    </style>
+</head>
+<body class="min-h-screen">
+    <header class="header-bg py-4">
+        <div class="max-w-[1012px] mx-auto px-4">
+            <nav class="flex items-center space-x-1 text-sm">
+                {% for crumb in breadcrumbs %}
+                    {% if crumb.is_last %}
+                        <span class="font-semibold">{{ crumb.name }}</span>
+                    {% else %}
+                        <a href="{{ crumb.path }}" class="link-color">{{ crumb.name }}</a>
+                        <span class="breadcrumb-separator">/</span>
+                    {% endif %}
+                {% endfor %}
+            </nav>
+        </div>
+    </header>
+
+    <main class="max-w-[1012px] mx-auto px-4 py-6">
+        <div class="container-box overflow-hidden">
+            <div class="file-header px-4 py-3 flex items-center justify-between">
+                <div class="flex items-center">
+                    <svg class="w-4 h-4 mr-2 text-[#8b949e]" fill="currentColor" viewBox="0 0 16 16">
+                        <path d="M2 1.75C2 .784 2.784 0 3.75 0h6.586c.464 0 .909.184 1.237.513l2.914 2.914c.329.328.513.773.513 1.237v9.586A1.75 1.75 0 0113.25 16h-9.5A1.75 1.75 0 012 14.25V1.75z"/>
+                    </svg>
+                    <span class="font-semibold">{{ filename }}</span>
+                    <span class="text-muted ml-4 text-sm">{{ file_size }}</span>
+                </div>
+                <a href="{{ raw_path }}" class="raw-button">Raw</a>
+            </div>
+            <article class="markdown-body">
+                {{ content|safe }}
+            </article>
+        </div>
+    </main>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-rust.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-typescript.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-go.min.js"></script>
+    <script>
+        document.querySelectorAll('pre code').forEach((block) => {
+            const className = block.className;
+            if (className && className.startsWith('language-')) {
+                Prism.highlightElement(block);
+            }
+        });
+    </script>
+</body>
+</html>

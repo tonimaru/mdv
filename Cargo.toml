@@ -1,0 +1,15 @@
+[package]
+name = "mdv"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+askama = "0.12"
+askama_axum = "0.4"
+tower-http = { version = "0.6", features = ["fs"] }
+mime_guess = "2"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }

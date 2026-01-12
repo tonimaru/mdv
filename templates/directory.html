@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MDV - Directory Viewer</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            background-color: #0d1117;
+            color: #c9d1d9;
+        }
+        .header-bg {
+            background-color: #161b22;
+            border-bottom: 1px solid #30363d;
+        }
+        .container-box {
+            background-color: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+        }
+        .file-row {
+            border-bottom: 1px solid #21262d;
+        }
+        .file-row:last-child {
+            border-bottom: none;
+        }
+        .file-row:hover {
+            background-color: #161b22;
+        }
+        .link-color {
+            color: #58a6ff;
+        }
+        .link-color:hover {
+            text-decoration: underline;
+        }
+        .breadcrumb-separator {
+            color: #8b949e;
+        }
+        .text-muted {
+            color: #8b949e;
+        }
+    </style>
+</head>
+<body class="min-h-screen">
+    <header class="header-bg py-4">
+        <div class="max-w-[1012px] mx-auto px-4">
+            <nav class="flex items-center space-x-1 text-sm">
+                {% for crumb in breadcrumbs %}
+                    {% if crumb.is_last %}
+                        <span class="font-semibold">{{ crumb.name }}</span>
+                    {% else %}
+                        <a href="{{ crumb.path }}" class="link-color">{{ crumb.name }}</a>
+                        <span class="breadcrumb-separator">/</span>
+                    {% endif %}
+                {% endfor %}
+            </nav>
+        </div>
+    </header>
+
+    <main class="max-w-[1012px] mx-auto px-4 py-6">
+        <div class="container-box overflow-hidden">
+            <table class="w-full text-sm">
+                <thead>
+                    <tr class="text-left text-muted border-b border-[#30363d]">
+                        <th class="py-2 px-4 font-normal">Name</th>
+                        <th class="py-2 px-4 font-normal w-32 text-right">Size</th>
+                        <th class="py-2 px-4 font-normal w-40 text-right">Last Modified</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% if has_parent %}
+                    <tr class="file-row">
+                        <td class="py-2 px-4" colspan="3">
+                            <a href="{{ parent_path }}" class="link-color flex items-center">
+                                <svg class="w-4 h-4 mr-2 text-[#8b949e]" fill="currentColor" viewBox="0 0 16 16">
+                                    <path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25v-8.5A1.75 1.75 0 0014.25 3H7.5a.25.25 0 01-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75z"/>
+                                </svg>
+                                ..
+                            </a>
+                        </td>
+                    </tr>
+                    {% endif %}
+                    {% for entry in entries %}
+                    <tr class="file-row">
+                        <td class="py-2 px-4">
+                            <a href="{{ entry.path }}" class="link-color flex items-center">
+                                {% if entry.is_dir %}
+                                <svg class="w-4 h-4 mr-2 text-[#54aeff]" fill="currentColor" viewBox="0 0 16 16">
+                                    <path d="M1.75 1A1.75 1.75 0 000 2.75v10.5C0 14.216.784 15 1.75 15h12.5A1.75 1.75 0 0016 13.25v-8.5A1.75 1.75 0 0014.25 3H7.5a.25.25 0 01-.2-.1l-.9-1.2C6.07 1.26 5.55 1 5 1H1.75z"/>
+                                </svg>
+                                {% else %}
+                                <svg class="w-4 h-4 mr-2 text-[#8b949e]" fill="currentColor" viewBox="0 0 16 16">
+                                    <path d="M2 1.75C2 .784 2.784 0 3.75 0h6.586c.464 0 .909.184 1.237.513l2.914 2.914c.329.328.513.773.513 1.237v9.586A1.75 1.75 0 0113.25 16h-9.5A1.75 1.75 0 012 14.25V1.75z"/>
+                                </svg>
+                                {% endif %}
+                                {{ entry.name }}
+                            </a>
+                        </td>
+                        <td class="py-2 px-4 text-right text-muted">{{ entry.size }}</td>
+                        <td class="py-2 px-4 text-right text-muted">{{ entry.modified }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </main>
+</body>
+</html>
