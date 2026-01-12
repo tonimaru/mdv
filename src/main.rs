@@ -673,25 +673,47 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState) {
     }
 }
 
-// Root redirect to status
-async fn handle_root() -> Response {
-    (
-        StatusCode::OK,
-        Html(r#"<!DOCTYPE html>
+// Root page with workspace list
+async fn handle_root(State(state): State<AppState>) -> Response {
+    let inner = state.inner.read().await;
+    let workspaces: Vec<_> = inner.workspaces.values().collect();
+
+    let workspace_list = if workspaces.is_empty() {
+        "<p style=\"color:#8b949e;\">No workspaces registered yet.</p>".to_string()
+    } else {
+        let items: Vec<String> = workspaces
+            .iter()
+            .map(|ws| {
+                format!(
+                    r#"<li><a href="/view/{}" style="color:#58a6ff;">{}</a> <span style="color:#8b949e;">- {}</span></li>"#,
+                    ws.id, ws.name, ws.root_dir.display()
+                )
+            })
+            .collect();
+        format!("<ul>{}</ul>", items.join("\n"))
+    };
+
+    let html = format!(
+        r#"<!DOCTYPE html>
 <html>
 <head><title>mdv server</title></head>
 <body style="background:#0d1117;color:#c9d1d9;font-family:sans-serif;padding:2rem;">
 <h1>mdv server is running</h1>
 <p>Use your editor plugin to register workspaces and open files.</p>
-<p>API endpoints:</p>
+<h2>Workspaces</h2>
+{}
+<h2>API endpoints</h2>
 <ul>
 <li>POST /api/workspace/register - Register a workspace</li>
 <li>GET /api/active?path=... - Navigate to a file</li>
 <li>GET /api/status - Server status</li>
 </ul>
 </body>
-</html>"#),
-    ).into_response()
+</html>"#,
+        workspace_list
+    );
+
+    (StatusCode::OK, Html(html)).into_response()
 }
 
 #[tokio::main]
