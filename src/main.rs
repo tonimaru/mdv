@@ -2,18 +2,25 @@ use askama::Template;
 use axum::{
     extract::{Path, State},
     http::{header, StatusCode},
-    response::{Html, IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        Html, IntoResponse, Response,
+    },
     routing::get,
     Router,
 };
 use chrono::{DateTime, Local};
 use clap::Parser;
+use futures::stream::Stream;
+use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use pulldown_cmark::{html, Options, Parser as MdParser};
 use std::{
+    convert::Infallible,
     fs,
     path::PathBuf,
     sync::Arc,
 };
+use tokio::sync::broadcast;
 
 #[derive(Parser)]
 #[command(name = "mdv")]
@@ -35,6 +42,7 @@ struct Args {
 #[derive(Clone)]
 struct AppState {
     root_dir: Arc<PathBuf>,
+    reload_tx: broadcast::Sender<()>,
 }
 
 #[derive(Clone)]
@@ -353,6 +361,30 @@ async fn handle_raw(
     }
 }
 
+async fn handle_reload(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let mut rx = state.reload_tx.subscribe();
+
+    let stream = async_stream::stream! {
+        loop {
+            match rx.recv().await {
+                Ok(()) => {
+                    yield Ok(Event::default().event("reload").data("reload"));
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    break;
+                }
+            }
+        }
+    };
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -367,12 +399,41 @@ async fn main() {
         std::process::exit(1);
     }
 
+    let (reload_tx, _) = broadcast::channel::<()>(16);
+    let reload_tx_clone = reload_tx.clone();
+
+    let watch_dir = root_dir.clone();
+    std::thread::spawn(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = RecommendedWatcher::new(tx, Config::default()).unwrap();
+        watcher.watch(&watch_dir, RecursiveMode::Recursive).unwrap();
+
+        loop {
+            match rx.recv() {
+                Ok(Ok(event)) => {
+                    let dominated_by_md = event.paths.iter().any(|p| {
+                        p.extension().and_then(|e| e.to_str()) == Some("md")
+                    });
+                    if dominated_by_md {
+                        let _ = reload_tx_clone.send(());
+                    }
+                }
+                Ok(Err(e)) => {
+                    eprintln!("Watch error: {}", e);
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
     let state = AppState {
         root_dir: Arc::new(root_dir.clone()),
+        reload_tx,
     };
 
     let app = Router::new()
         .route("/", get(handle_root))
+        .route("/_reload", get(handle_reload))
         .route("/_raw/{*path}", get(handle_raw))
         .route("/{*path}", get(handle_path))
         .with_state(state);

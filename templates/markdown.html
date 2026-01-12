@@ -146,6 +146,11 @@
                 Prism.highlightElement(block);
             }
         });
+
+        const evtSource = new EventSource('/_reload');
+        evtSource.addEventListener('reload', () => {
+            location.reload();
+        });
     </script>
 </body>
 </html>
