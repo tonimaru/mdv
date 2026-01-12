@@ -307,7 +307,7 @@ async fn render_markdown_file(_state: &AppState, full_path: &PathBuf, url_path: 
         .unwrap_or("unknown")
         .to_string();
 
-    let raw_path = format!("/_raw{}", url_path);
+    let raw_path = format!("/_raw/{}", url_path.trim_start_matches('/'));
 
     let template = MarkdownTemplate {
         breadcrumbs,
