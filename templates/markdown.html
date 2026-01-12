@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ filename }} - MDV</title>
+    <title>{{ filename }} - {{ workspace_name }} - MDV</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.5.1/github-markdown-dark.min.css">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-tomorrow.min.css">
@@ -49,6 +49,14 @@
         .raw-button:hover {
             background-color: #30363d;
         }
+        .workspace-badge {
+            background-color: #238636;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            margin-left: 8px;
+        }
         .markdown-body {
             box-sizing: border-box;
             min-width: 200px;
@@ -70,21 +78,31 @@
                 padding: 15px;
             }
         }
+        @keyframes flash {
+            0%, 100% { background-color: #0d1117; }
+            50% { background-color: #1f6feb33; }
+        }
+        .flash {
+            animation: flash 0.5s ease-in-out 2;
+        }
     </style>
 </head>
 <body class="min-h-screen">
     <header class="header-bg py-4">
         <div class="max-w-[1012px] mx-auto px-4">
-            <nav class="flex items-center space-x-1 text-sm">
-                {% for crumb in breadcrumbs %}
-                    {% if crumb.is_last %}
-                        <span class="font-semibold">{{ crumb.name }}</span>
-                    {% else %}
-                        <a href="{{ crumb.path }}" class="link-color">{{ crumb.name }}</a>
-                        <span class="breadcrumb-separator">/</span>
-                    {% endif %}
-                {% endfor %}
-            </nav>
+            <div class="flex items-center justify-between">
+                <nav class="flex items-center space-x-1 text-sm">
+                    {% for crumb in breadcrumbs %}
+                        {% if crumb.is_last %}
+                            <span class="font-semibold">{{ crumb.name }}</span>
+                        {% else %}
+                            <a href="{{ crumb.path }}" class="link-color">{{ crumb.name }}</a>
+                            <span class="breadcrumb-separator">/</span>
+                        {% endif %}
+                    {% endfor %}
+                </nav>
+                <span class="workspace-badge">{{ workspace_name }}</span>
+            </div>
         </div>
     </header>
 
@@ -147,12 +165,16 @@
             }
         });
 
-        const evtSource = new EventSource('/_reload');
+        const workspaceId = '{{ workspace_id }}';
+        const originalTitle = document.title;
+
+        // Hot reload via SSE
+        const evtSource = new EventSource(`/_reload/${workspaceId}`);
         evtSource.addEventListener('reload', () => {
             location.reload();
         });
 
-        // WebSocket for remote control (Vim/Neovim integration)
+        // WebSocket for remote control
         const ws = new WebSocket(`ws://${location.host}/ws`);
         let ignoreScroll = false;
 
@@ -163,6 +185,13 @@
             } else if (data.type === 'scroll' && !ignoreScroll) {
                 const target = (document.documentElement.scrollHeight - window.innerHeight) * (data.percent / 100);
                 window.scrollTo({ top: target, behavior: 'smooth' });
+            } else if (data.type === 'focus' && data.workspace_id === workspaceId) {
+                document.title = '[EDITING] ' + originalTitle;
+                document.body.classList.add('flash');
+                setTimeout(() => {
+                    document.body.classList.remove('flash');
+                    document.title = originalTitle;
+                }, 3000);
             }
         };
 

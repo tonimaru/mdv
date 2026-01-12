@@ -16,8 +16,8 @@ command! MdvScrollToggle call mdv#toggle_scroll()
 " Autocommands for markdown files
 augroup mdv_sync
   autocmd!
-  " Sync page when entering a markdown buffer
-  autocmd BufEnter *.md call mdv#sync_page()
+  " Auto-register workspace and navigate on BufEnter
+  autocmd BufEnter *.md call mdv#on_buf_enter()
   " Sync scroll on cursor movement
   autocmd CursorMoved,CursorMovedI *.md call mdv#sync_scroll()
 augroup END

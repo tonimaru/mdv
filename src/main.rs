@@ -9,34 +9,28 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         Html, IntoResponse, Response,
     },
-    routing::get,
-    Router,
+    routing::{get, post},
+    Json, Router,
 };
 use chrono::{DateTime, Local};
 use clap::Parser;
-use futures::{
-    stream::Stream,
-    SinkExt, StreamExt,
-};
+use futures::{stream::Stream, SinkExt, StreamExt};
 use notify::{Config, PollWatcher, RecursiveMode, Watcher};
 use pulldown_cmark::{html, Options, Parser as MdParser};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     convert::Infallible,
     fs,
     path::PathBuf,
     sync::Arc,
 };
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, RwLock};
 
 #[derive(Parser)]
 #[command(name = "mdv")]
-#[command(about = "Markdown Directory Viewer - A web-based markdown preview tool")]
+#[command(about = "Markdown Directory Viewer - A multi-workspace markdown preview server")]
 struct Args {
-    /// Root directory to serve
-    #[arg(default_value = ".")]
-    root: PathBuf,
-
     /// Port to listen on
     #[arg(short, long, default_value = "3000")]
     port: u16,
@@ -46,22 +40,60 @@ struct Args {
     host: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WsCommand {
     Navigate { url: String },
     Scroll { percent: u32 },
+    Focus { workspace_id: String, file_path: String },
+}
+
+struct Workspace {
+    id: String,
+    root_dir: PathBuf,
+    name: String,
+    #[allow(dead_code)]
+    watcher_handle: Option<std::thread::JoinHandle<()>>,
+}
+
+struct AppStateInner {
+    workspaces: HashMap<String, Workspace>,
 }
 
 #[derive(Clone)]
 struct AppState {
-    root_dir: Arc<PathBuf>,
-    reload_tx: broadcast::Sender<()>,
+    inner: Arc<RwLock<AppStateInner>>,
+    reload_tx: broadcast::Sender<String>,
     ws_tx: broadcast::Sender<WsCommand>,
 }
 
 #[derive(Deserialize)]
-struct NavigateQuery {
+struct RegisterRequest {
+    path: String,
+}
+
+#[derive(Serialize)]
+struct RegisterResponse {
+    id: String,
+    name: String,
+    url: String,
+}
+
+#[derive(Deserialize)]
+struct ActiveQuery {
+    path: String,
+}
+
+#[derive(Serialize)]
+struct StatusResponse {
+    status: String,
+    workspaces: Vec<WorkspaceInfo>,
+}
+
+#[derive(Serialize)]
+struct WorkspaceInfo {
+    id: String,
+    name: String,
     path: String,
 }
 
@@ -93,6 +125,8 @@ struct DirectoryTemplate {
     entries: Vec<FileEntry>,
     has_parent: bool,
     parent_path: String,
+    workspace_id: String,
+    workspace_name: String,
 }
 
 #[derive(Template)]
@@ -103,18 +137,38 @@ struct MarkdownTemplate {
     filename: String,
     file_size: String,
     raw_path: String,
+    workspace_id: String,
+    workspace_name: String,
 }
 
-fn generate_breadcrumbs(path: &str) -> Vec<BreadcrumbItem> {
+fn generate_workspace_id(path: &PathBuf) -> String {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace");
+
+    let hash = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        path.hash(&mut hasher);
+        hasher.finish()
+    };
+
+    format!("{}-{:x}", name, hash & 0xFFFF)
+}
+
+fn generate_breadcrumbs(workspace_id: &str, path: &str) -> Vec<BreadcrumbItem> {
+    let base_path = format!("/view/{}", workspace_id);
     let mut breadcrumbs = vec![BreadcrumbItem {
         name: "root".to_string(),
-        path: "/".to_string(),
+        path: base_path.clone(),
         is_last: path.is_empty(),
     }];
 
     if !path.is_empty() {
         let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        let mut current_path = String::new();
+        let mut current_path = base_path;
 
         for (i, part) in parts.iter().enumerate() {
             current_path.push('/');
@@ -201,28 +255,179 @@ fn validate_path(root: &PathBuf, requested_path: &str) -> Option<PathBuf> {
     }
 }
 
-async fn handle_root(State(state): State<AppState>) -> Response {
-    handle_path_internal(&state, "").await
-}
-
-async fn handle_path(
+// API: Register workspace
+async fn api_register(
     State(state): State<AppState>,
-    Path(path): Path<String>,
+    Json(req): Json<RegisterRequest>,
 ) -> Response {
-    handle_path_internal(&state, &path).await
+    let path = PathBuf::from(&req.path);
+    let Ok(canonical_path) = path.canonicalize() else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Invalid path"}))).into_response();
+    };
+
+    if !canonical_path.is_dir() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Path is not a directory"}))).into_response();
+    }
+
+    let workspace_id = generate_workspace_id(&canonical_path);
+    let workspace_name = canonical_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace")
+        .to_string();
+
+    let mut inner = state.inner.write().await;
+
+    if !inner.workspaces.contains_key(&workspace_id) {
+        let reload_tx = state.reload_tx.clone();
+        let watch_id = workspace_id.clone();
+        let watch_dir = canonical_path.clone();
+
+        let watcher_handle = std::thread::spawn(move || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let config = Config::default().with_poll_interval(std::time::Duration::from_millis(500));
+            let Ok(mut watcher) = PollWatcher::new(tx, config) else { return };
+            if watcher.watch(&watch_dir, RecursiveMode::Recursive).is_err() {
+                return;
+            }
+
+            loop {
+                match rx.recv() {
+                    Ok(Ok(event)) => {
+                        let is_md = event.paths.iter().any(|p| {
+                            p.extension().and_then(|e| e.to_str()) == Some("md")
+                        });
+                        if is_md {
+                            let _ = reload_tx.send(watch_id.clone());
+                        }
+                    }
+                    Ok(Err(_)) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+
+        inner.workspaces.insert(
+            workspace_id.clone(),
+            Workspace {
+                id: workspace_id.clone(),
+                root_dir: canonical_path.clone(),
+                name: workspace_name.clone(),
+                watcher_handle: Some(watcher_handle),
+            },
+        );
+    }
+
+    let response = RegisterResponse {
+        id: workspace_id.clone(),
+        name: workspace_name,
+        url: format!("/view/{}", workspace_id),
+    };
+
+    Json(response).into_response()
 }
 
-async fn handle_path_internal(state: &AppState, path: &str) -> Response {
-    let Some(full_path) = validate_path(&state.root_dir, path) else {
+// API: Get active file URL and notify browser
+async fn api_active(
+    State(state): State<AppState>,
+    Query(query): Query<ActiveQuery>,
+) -> Response {
+    let abs_path = PathBuf::from(&query.path);
+    let Ok(canonical_path) = abs_path.canonicalize() else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Invalid path"}))).into_response();
+    };
+
+    let inner = state.inner.read().await;
+
+    for (id, workspace) in &inner.workspaces {
+        if let Ok(workspace_canonical) = workspace.root_dir.canonicalize() {
+            if canonical_path.starts_with(&workspace_canonical) {
+                let relative = canonical_path
+                    .strip_prefix(&workspace_canonical)
+                    .unwrap_or(&canonical_path);
+                let relative_str = relative.to_string_lossy();
+                let url = format!("/view/{}/{}", id, relative_str);
+
+                let _ = state.ws_tx.send(WsCommand::Focus {
+                    workspace_id: id.clone(),
+                    file_path: relative_str.to_string(),
+                });
+                let _ = state.ws_tx.send(WsCommand::Navigate { url: url.clone() });
+
+                return Json(serde_json::json!({
+                    "url": url,
+                    "workspace_id": id,
+                })).into_response();
+            }
+        }
+    }
+
+    (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "File not in any registered workspace"}))).into_response()
+}
+
+// API: Status check
+async fn api_status(State(state): State<AppState>) -> Json<StatusResponse> {
+    let inner = state.inner.read().await;
+    let workspaces: Vec<WorkspaceInfo> = inner
+        .workspaces
+        .values()
+        .map(|w| WorkspaceInfo {
+            id: w.id.clone(),
+            name: w.name.clone(),
+            path: w.root_dir.to_string_lossy().to_string(),
+        })
+        .collect();
+
+    Json(StatusResponse {
+        status: "ok".to_string(),
+        workspaces,
+    })
+}
+
+// API: Scroll sync
+async fn api_scroll(
+    State(state): State<AppState>,
+    Query(query): Query<ScrollQuery>,
+) -> &'static str {
+    let _ = state.ws_tx.send(WsCommand::Scroll { percent: query.percent });
+    "ok"
+}
+
+// View workspace root
+async fn handle_view_root(
+    State(state): State<AppState>,
+    Path(workspace_id): Path<String>,
+) -> Response {
+    handle_view_path_internal(&state, &workspace_id, "").await
+}
+
+// View workspace path
+async fn handle_view_path(
+    State(state): State<AppState>,
+    Path((workspace_id, path)): Path<(String, String)>,
+) -> Response {
+    handle_view_path_internal(&state, &workspace_id, &path).await
+}
+
+async fn handle_view_path_internal(state: &AppState, workspace_id: &str, path: &str) -> Response {
+    let inner = state.inner.read().await;
+    let Some(workspace) = inner.workspaces.get(workspace_id) else {
+        return (StatusCode::NOT_FOUND, Html("Workspace not found")).into_response();
+    };
+
+    let Some(full_path) = validate_path(&workspace.root_dir, path) else {
         return (StatusCode::NOT_FOUND, Html("Not Found")).into_response();
     };
 
+    let workspace_name = workspace.name.clone();
+    drop(inner);
+
     if full_path.is_dir() {
-        render_directory(state, &full_path, path).await
+        render_directory(workspace_id, &workspace_name, &full_path, path).await
     } else if full_path.is_file() {
         let extension = full_path.extension().and_then(|e| e.to_str()).unwrap_or("");
         if extension == "md" {
-            render_markdown_file(state, &full_path, path).await
+            render_markdown_file(workspace_id, &workspace_name, &full_path, path).await
         } else {
             serve_static_file(&full_path).await
         }
@@ -231,10 +436,17 @@ async fn handle_path_internal(state: &AppState, path: &str) -> Response {
     }
 }
 
-async fn render_directory(_state: &AppState, full_path: &PathBuf, url_path: &str) -> Response {
+async fn render_directory(
+    workspace_id: &str,
+    workspace_name: &str,
+    full_path: &PathBuf,
+    url_path: &str,
+) -> Response {
     let Ok(read_dir) = fs::read_dir(full_path) else {
         return (StatusCode::INTERNAL_SERVER_ERROR, Html("Failed to read directory")).into_response();
     };
+
+    let base_url = format!("/view/{}", workspace_id);
 
     let mut entries: Vec<FileEntry> = read_dir
         .filter_map(|entry| entry.ok())
@@ -271,9 +483,9 @@ async fn render_directory(_state: &AppState, full_path: &PathBuf, url_path: &str
                 .unwrap_or_else(|| "-".to_string());
 
             let entry_path = if url_path.is_empty() {
-                format!("/{}", name)
+                format!("{}/{}", base_url, name)
             } else {
-                format!("/{}/{}", url_path.trim_start_matches('/'), name)
+                format!("{}/{}/{}", base_url, url_path.trim_start_matches('/'), name)
             };
 
             Some(FileEntry {
@@ -286,25 +498,23 @@ async fn render_directory(_state: &AppState, full_path: &PathBuf, url_path: &str
         })
         .collect();
 
-    entries.sort_by(|a, b| {
-        match (a.is_dir, b.is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        }
+    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
 
-    let breadcrumbs = generate_breadcrumbs(url_path);
+    let breadcrumbs = generate_breadcrumbs(workspace_id, url_path);
     let has_parent = !url_path.is_empty();
     let parent_path = if has_parent {
         let parts: Vec<&str> = url_path.split('/').filter(|s| !s.is_empty()).collect();
         if parts.len() <= 1 {
-            "/".to_string()
+            base_url
         } else {
-            format!("/{}", parts[..parts.len() - 1].join("/"))
+            format!("{}/{}", base_url, parts[..parts.len() - 1].join("/"))
         }
     } else {
-        "/".to_string()
+        base_url
     };
 
     let template = DirectoryTemplate {
@@ -312,6 +522,8 @@ async fn render_directory(_state: &AppState, full_path: &PathBuf, url_path: &str
         entries,
         has_parent,
         parent_path,
+        workspace_id: workspace_id.to_string(),
+        workspace_name: workspace_name.to_string(),
     };
 
     match template.render() {
@@ -320,13 +532,18 @@ async fn render_directory(_state: &AppState, full_path: &PathBuf, url_path: &str
     }
 }
 
-async fn render_markdown_file(_state: &AppState, full_path: &PathBuf, url_path: &str) -> Response {
+async fn render_markdown_file(
+    workspace_id: &str,
+    workspace_name: &str,
+    full_path: &PathBuf,
+    url_path: &str,
+) -> Response {
     let Ok(content) = fs::read_to_string(full_path) else {
         return (StatusCode::INTERNAL_SERVER_ERROR, Html("Failed to read file")).into_response();
     };
 
     let html_content = render_markdown(&content);
-    let breadcrumbs = generate_breadcrumbs(url_path);
+    let breadcrumbs = generate_breadcrumbs(workspace_id, url_path);
 
     let metadata = fs::metadata(full_path).ok();
     let file_size = metadata
@@ -340,7 +557,7 @@ async fn render_markdown_file(_state: &AppState, full_path: &PathBuf, url_path: 
         .unwrap_or("unknown")
         .to_string();
 
-    let raw_path = format!("/_raw/{}", url_path.trim_start_matches('/'));
+    let raw_path = format!("/_raw/{}/{}", workspace_id, url_path.trim_start_matches('/'));
 
     let template = MarkdownTemplate {
         breadcrumbs,
@@ -348,6 +565,8 @@ async fn render_markdown_file(_state: &AppState, full_path: &PathBuf, url_path: 
         filename,
         file_size,
         raw_path,
+        workspace_id: workspace_id.to_string(),
+        workspace_name: workspace_name.to_string(),
     };
 
     match template.render() {
@@ -373,11 +592,17 @@ async fn serve_static_file(full_path: &PathBuf) -> Response {
 
 async fn handle_raw(
     State(state): State<AppState>,
-    Path(path): Path<String>,
+    Path((workspace_id, path)): Path<(String, String)>,
 ) -> Response {
-    let Some(full_path) = validate_path(&state.root_dir, &path) else {
+    let inner = state.inner.read().await;
+    let Some(workspace) = inner.workspaces.get(&workspace_id) else {
+        return (StatusCode::NOT_FOUND, Html("Workspace not found")).into_response();
+    };
+
+    let Some(full_path) = validate_path(&workspace.root_dir, &path) else {
         return (StatusCode::NOT_FOUND, Html("Not Found")).into_response();
     };
+    drop(inner);
 
     if full_path.is_file() {
         serve_static_file(&full_path).await
@@ -388,21 +613,21 @@ async fn handle_raw(
 
 async fn handle_reload(
     State(state): State<AppState>,
+    Path(workspace_id): Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let mut rx = state.reload_tx.subscribe();
+    let ws_id = workspace_id.clone();
 
     let stream = async_stream::stream! {
         loop {
             match rx.recv().await {
-                Ok(()) => {
-                    yield Ok(Event::default().event("reload").data("reload"));
+                Ok(id) => {
+                    if id == ws_id {
+                        yield Ok(Event::default().event("reload").data("reload"));
+                    }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    continue;
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    break;
-                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     };
@@ -410,10 +635,7 @@ async fn handle_reload(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-async fn handle_ws(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> Response {
+async fn handle_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     ws.on_upgrade(|socket| handle_ws_connection(socket, state))
 }
 
@@ -451,84 +673,53 @@ async fn handle_ws_connection(socket: WebSocket, state: AppState) {
     }
 }
 
-async fn handle_navigate(
-    State(state): State<AppState>,
-    Query(query): Query<NavigateQuery>,
-) -> &'static str {
-    let url = if query.path.starts_with('/') {
-        query.path
-    } else {
-        format!("/{}", query.path)
-    };
-    let _ = state.ws_tx.send(WsCommand::Navigate { url });
-    "ok"
-}
-
-async fn handle_scroll(
-    State(state): State<AppState>,
-    Query(query): Query<ScrollQuery>,
-) -> &'static str {
-    let _ = state.ws_tx.send(WsCommand::Scroll { percent: query.percent });
-    "ok"
+// Root redirect to status
+async fn handle_root() -> Response {
+    (
+        StatusCode::OK,
+        Html(r#"<!DOCTYPE html>
+<html>
+<head><title>mdv server</title></head>
+<body style="background:#0d1117;color:#c9d1d9;font-family:sans-serif;padding:2rem;">
+<h1>mdv server is running</h1>
+<p>Use your editor plugin to register workspaces and open files.</p>
+<p>API endpoints:</p>
+<ul>
+<li>POST /api/workspace/register - Register a workspace</li>
+<li>GET /api/active?path=... - Navigate to a file</li>
+<li>GET /api/status - Server status</li>
+</ul>
+</body>
+</html>"#),
+    ).into_response()
 }
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
 
-    let root_dir = args.root.canonicalize().unwrap_or_else(|e| {
-        eprintln!("Error: Cannot resolve root directory: {}", e);
-        std::process::exit(1);
-    });
-
-    if !root_dir.is_dir() {
-        eprintln!("Error: {} is not a directory", root_dir.display());
-        std::process::exit(1);
-    }
-
-    let (reload_tx, _) = broadcast::channel::<()>(16);
-    let reload_tx_clone = reload_tx.clone();
+    let (reload_tx, _) = broadcast::channel::<String>(16);
     let (ws_tx, _) = broadcast::channel::<WsCommand>(16);
 
-    let watch_dir = root_dir.clone();
-    std::thread::spawn(move || {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let config = Config::default().with_poll_interval(std::time::Duration::from_millis(500));
-        let mut watcher = PollWatcher::new(tx, config).unwrap();
-        watcher.watch(&watch_dir, RecursiveMode::Recursive).unwrap();
-
-        loop {
-            match rx.recv() {
-                Ok(Ok(event)) => {
-                    let dominated_by_md = event.paths.iter().any(|p| {
-                        p.extension().and_then(|e| e.to_str()) == Some("md")
-                    });
-                    if dominated_by_md {
-                        let _ = reload_tx_clone.send(());
-                    }
-                }
-                Ok(Err(e)) => {
-                    eprintln!("Watch error: {}", e);
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
     let state = AppState {
-        root_dir: Arc::new(root_dir.clone()),
+        inner: Arc::new(RwLock::new(AppStateInner {
+            workspaces: HashMap::new(),
+        })),
         reload_tx,
         ws_tx,
     };
 
     let app = Router::new()
         .route("/", get(handle_root))
-        .route("/_reload", get(handle_reload))
+        .route("/api/workspace/register", post(api_register))
+        .route("/api/active", get(api_active))
+        .route("/api/status", get(api_status))
+        .route("/api/remote/scroll", get(api_scroll))
         .route("/ws", get(handle_ws))
-        .route("/api/remote/navigate", get(handle_navigate))
-        .route("/api/remote/scroll", get(handle_scroll))
-        .route("/_raw/{*path}", get(handle_raw))
-        .route("/{*path}", get(handle_path))
+        .route("/view/{workspace_id}", get(handle_view_root))
+        .route("/view/{workspace_id}/{*path}", get(handle_view_path))
+        .route("/_reload/{workspace_id}", get(handle_reload))
+        .route("/_raw/{workspace_id}/{*path}", get(handle_raw))
         .with_state(state);
 
     let addr = format!("{}:{}", args.host, args.port);
@@ -537,7 +728,7 @@ async fn main() {
         std::process::exit(1);
     });
 
-    println!("Serving {} at http://{}", root_dir.display(), addr);
+    println!("mdv server listening at http://{}", addr);
 
     axum::serve(listener, app).await.unwrap();
 }
