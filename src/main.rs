@@ -1,6 +1,9 @@
 use askama::Template;
 use axum::{
-    extract::{Path, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, Query, State,
+    },
     http::{header, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
@@ -11,9 +14,13 @@ use axum::{
 };
 use chrono::{DateTime, Local};
 use clap::Parser;
-use futures::stream::Stream;
+use futures::{
+    stream::Stream,
+    SinkExt, StreamExt,
+};
 use notify::{Config, PollWatcher, RecursiveMode, Watcher};
 use pulldown_cmark::{html, Options, Parser as MdParser};
+use serde::{Deserialize, Serialize};
 use std::{
     convert::Infallible,
     fs,
@@ -39,10 +46,28 @@ struct Args {
     host: String,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WsCommand {
+    Navigate { url: String },
+    Scroll { percent: u32 },
+}
+
 #[derive(Clone)]
 struct AppState {
     root_dir: Arc<PathBuf>,
     reload_tx: broadcast::Sender<()>,
+    ws_tx: broadcast::Sender<WsCommand>,
+}
+
+#[derive(Deserialize)]
+struct NavigateQuery {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct ScrollQuery {
+    percent: u32,
 }
 
 #[derive(Clone)]
@@ -385,6 +410,68 @@ async fn handle_reload(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
+async fn handle_ws(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> Response {
+    ws.on_upgrade(|socket| handle_ws_connection(socket, state))
+}
+
+async fn handle_ws_connection(socket: WebSocket, state: AppState) {
+    let (mut sender, mut receiver) = socket.split();
+    let mut ws_rx = state.ws_tx.subscribe();
+
+    let send_task = tokio::spawn(async move {
+        loop {
+            match ws_rx.recv().await {
+                Ok(cmd) => {
+                    if let Ok(json) = serde_json::to_string(&cmd) {
+                        if sender.send(Message::Text(json.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    let recv_task = tokio::spawn(async move {
+        while let Some(Ok(msg)) = receiver.next().await {
+            if let Message::Close(_) = msg {
+                break;
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = send_task => {}
+        _ = recv_task => {}
+    }
+}
+
+async fn handle_navigate(
+    State(state): State<AppState>,
+    Query(query): Query<NavigateQuery>,
+) -> &'static str {
+    let url = if query.path.starts_with('/') {
+        query.path
+    } else {
+        format!("/{}", query.path)
+    };
+    let _ = state.ws_tx.send(WsCommand::Navigate { url });
+    "ok"
+}
+
+async fn handle_scroll(
+    State(state): State<AppState>,
+    Query(query): Query<ScrollQuery>,
+) -> &'static str {
+    let _ = state.ws_tx.send(WsCommand::Scroll { percent: query.percent });
+    "ok"
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -401,6 +488,7 @@ async fn main() {
 
     let (reload_tx, _) = broadcast::channel::<()>(16);
     let reload_tx_clone = reload_tx.clone();
+    let (ws_tx, _) = broadcast::channel::<WsCommand>(16);
 
     let watch_dir = root_dir.clone();
     std::thread::spawn(move || {
@@ -430,11 +518,15 @@ async fn main() {
     let state = AppState {
         root_dir: Arc::new(root_dir.clone()),
         reload_tx,
+        ws_tx,
     };
 
     let app = Router::new()
         .route("/", get(handle_root))
         .route("/_reload", get(handle_reload))
+        .route("/ws", get(handle_ws))
+        .route("/api/remote/navigate", get(handle_navigate))
+        .route("/api/remote/scroll", get(handle_scroll))
         .route("/_raw/{*path}", get(handle_raw))
         .route("/{*path}", get(handle_path))
         .with_state(state);

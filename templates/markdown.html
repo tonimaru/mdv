@@ -151,6 +151,25 @@
         evtSource.addEventListener('reload', () => {
             location.reload();
         });
+
+        // WebSocket for remote control (Vim/Neovim integration)
+        const ws = new WebSocket(`ws://${location.host}/ws`);
+        let ignoreScroll = false;
+
+        ws.onmessage = (e) => {
+            const data = JSON.parse(e.data);
+            if (data.type === 'navigate') {
+                window.location.href = data.url;
+            } else if (data.type === 'scroll' && !ignoreScroll) {
+                const target = (document.documentElement.scrollHeight - window.innerHeight) * (data.percent / 100);
+                window.scrollTo({ top: target, behavior: 'smooth' });
+            }
+        };
+
+        window.onwheel = () => {
+            ignoreScroll = true;
+            setTimeout(() => { ignoreScroll = false; }, 2000);
+        };
     </script>
 </body>
 </html>
