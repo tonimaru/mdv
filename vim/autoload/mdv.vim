@@ -21,6 +21,7 @@ endif
 " Internal state
 let s:mdv_job = v:null
 let s:registered_workspaces = {}
+let s:workspace_cache = []
 
 " Get base URL
 function! s:base_url() abort
@@ -53,12 +54,17 @@ endfunction
 function! mdv#is_running() abort
   let l:url = s:base_url() . '/api/status'
   let l:result = system('curl -s -o /dev/null -w "%{http_code}" --max-time 1 ' . shellescape(l:url))
-  return l:result ==# '200'
+  let l:running = l:result ==# '200'
+  if !l:running
+    call s:clear_workspace_cache()
+  endif
+  return l:running
 endfunction
 
 " Start mdv server
 function! mdv#start() abort
   if mdv#is_running()
+    call s:refresh_workspace_cache()
     echo 'mdv server is already running on port ' . g:mdv_port
     return 1
   endif
@@ -78,6 +84,7 @@ function! mdv#start() abort
   while l:retries > 0
     sleep 100m
     if mdv#is_running()
+      call s:refresh_workspace_cache()
       echo 'mdv server started on port ' . g:mdv_port
       return 1
     endif
@@ -100,6 +107,7 @@ function! mdv#stop() abort
     silent execute '!pkill -f "mdv.*--port ' . g:mdv_port . '" 2>/dev/null'
   endif
   let s:registered_workspaces = {}
+  call s:clear_workspace_cache()
   echo 'mdv server stopped'
 endfunction
 
@@ -123,6 +131,39 @@ function! s:get_project_root() abort
   return getcwd()
 endfunction
 
+" Clear workspace cache
+function! s:clear_workspace_cache() abort
+  let s:workspace_cache = []
+endfunction
+
+" Refresh workspace cache from server
+function! s:refresh_workspace_cache() abort
+  if !mdv#is_running()
+    let s:workspace_cache = []
+    return
+  endif
+
+  let l:url = s:base_url() . '/api/status'
+  let l:result = system('curl -s --max-time 1 ' . shellescape(l:url))
+
+  try
+    let l:resp = json_decode(l:result)
+    let s:workspace_cache = l:resp.workspaces
+  catch
+    let s:workspace_cache = []
+  endtry
+endfunction
+
+" Find workspace that contains the given file path (uses cache)
+function! s:find_workspace_for_file(path) abort
+  for l:ws in s:workspace_cache
+    if a:path =~# '^' . escape(l:ws.path, '/') . '/'
+      return l:ws
+    endif
+  endfor
+  return {}
+endfunction
+
 " Register workspace with server
 function! mdv#register_workspace(...) abort
   if !s:ensure_server()
@@ -142,15 +183,10 @@ function! mdv#register_workspace(...) abort
   let l:result = system('curl -s -X POST -H "Content-Type: application/json" -d ' . shellescape(l:json) . ' ' . shellescape(l:url))
 
   try
-    " Parse JSON response
-    if has('nvim')
-      let l:resp = json_decode(l:result)
-    else
-      let l:resp = json_decode(l:result)
-    endif
-
+    let l:resp = json_decode(l:result)
     if has_key(l:resp, 'id')
       let s:registered_workspaces[l:root] = l:resp
+      call s:refresh_workspace_cache()
       return l:resp
     endif
   catch
@@ -161,7 +197,7 @@ endfunction
 
 " Navigate browser to current file
 function! mdv#active() abort
-  if !s:ensure_server()
+  if !mdv#is_running()
     return
   endif
 
@@ -175,14 +211,28 @@ function! mdv#active() abort
     return
   endif
 
-  " Register workspace first
-  let l:ws = mdv#register_workspace()
+  " Refresh cache if empty
+  if empty(s:workspace_cache)
+    call s:refresh_workspace_cache()
+  endif
+
+  " Only process files within registered workspaces
+  let l:ws = s:find_workspace_for_file(l:path)
   if empty(l:ws)
     return
   endif
 
   let l:url = s:base_url() . '/api/active?path=' . l:path
-  call s:run_silent(['curl', '-s', l:url])
+  let l:result = system('curl -s --max-time 1 ' . shellescape(l:url))
+
+  " Clear cache on error (workspace may have been removed externally)
+  try
+    let l:resp = json_decode(l:result)
+    if has_key(l:resp, 'error')
+      call s:clear_workspace_cache()
+    endif
+  catch
+  endtry
 endfunction
 
 " Open current file in browser
@@ -228,7 +278,7 @@ function! mdv#open() abort
   echo 'Opened in browser: ' . l:relative
 endfunction
 
-" Sync scroll position
+" Sync scroll position (only for registered workspaces)
 function! mdv#sync_scroll() abort
   if !g:mdv_sync_scroll
     return
@@ -245,6 +295,17 @@ function! mdv#sync_scroll() abort
 
   " Skip if file does not exist
   if !filereadable(l:path)
+    return
+  endif
+
+  " Refresh cache if empty
+  if empty(s:workspace_cache)
+    call s:refresh_workspace_cache()
+  endif
+
+  " Only process files within registered workspaces
+  let l:ws = s:find_workspace_for_file(l:path)
+  if empty(l:ws)
     return
   endif
 
@@ -278,6 +339,7 @@ function! mdv#status() abort
 
   try
     let l:resp = json_decode(l:result)
+    let s:workspace_cache = l:resp.workspaces
     echo 'mdv server running at ' . s:base_url()
     echo 'Scroll sync: ' . (g:mdv_sync_scroll ? 'ON' : 'OFF')
     echo 'Workspaces:'
@@ -289,7 +351,7 @@ function! mdv#status() abort
   endtry
 endfunction
 
-" Auto-register on BufEnter for .md files
+" Sync browser on BufEnter for .md files (only for registered workspaces)
 function! mdv#on_buf_enter() abort
   let l:path = expand('%:p')
   if l:path !~# '\.md$'
@@ -301,10 +363,8 @@ function! mdv#on_buf_enter() abort
     return
   endif
 
-  if mdv#is_running()
-    call mdv#register_workspace()
-    call mdv#active()
-  endif
+  " mdv#active() only processes files within registered workspaces
+  call mdv#active()
 endfunction
 
 " Add workspace (register with server)
@@ -330,6 +390,7 @@ function! mdv#workspace_add(...) abort
     let l:resp = json_decode(l:result)
     if has_key(l:resp, 'id')
       let s:registered_workspaces[l:path] = l:resp
+      call s:refresh_workspace_cache()
       echo 'Workspace added: ' . l:resp.name . ' (' . l:resp.id . ')'
     elseif has_key(l:resp, 'error')
       echoerr 'Error: ' . l:resp.error
@@ -407,6 +468,7 @@ function! mdv#workspace_remove(...) abort
           break
         endif
       endfor
+      call s:refresh_workspace_cache()
       echo 'Workspace removed: ' . l:workspace_id
     elseif has_key(l:del_resp, 'error')
       echoerr 'Error: ' . l:del_resp.error
