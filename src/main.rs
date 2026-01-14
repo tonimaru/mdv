@@ -262,6 +262,29 @@ fn validate_path(root: &PathBuf, requested_path: &str) -> Option<PathBuf> {
     }
 }
 
+fn json_error(status: StatusCode, message: &str) -> Response {
+    (status, Json(serde_json::json!({"error": message}))).into_response()
+}
+
+/// Finds the workspace containing the given absolute file path.
+/// Returns the workspace ID and relative path within the workspace.
+fn find_workspace_for_path<'a>(
+    workspaces: &'a HashMap<String, Workspace>,
+    abs_path: &std::path::Path,
+) -> Option<(&'a str, String)> {
+    for (id, workspace) in workspaces {
+        if let Ok(workspace_canonical) = workspace.root_dir.canonicalize() {
+            if abs_path.starts_with(&workspace_canonical) {
+                let relative = abs_path
+                    .strip_prefix(&workspace_canonical)
+                    .unwrap_or(abs_path);
+                return Some((id.as_str(), relative.to_string_lossy().to_string()));
+            }
+        }
+    }
+    None
+}
+
 // API: Register workspace
 async fn api_register(
     State(state): State<AppState>,
@@ -269,11 +292,11 @@ async fn api_register(
 ) -> Response {
     let path = PathBuf::from(&req.path);
     let Ok(canonical_path) = path.canonicalize() else {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Invalid path"}))).into_response();
+        return json_error(StatusCode::BAD_REQUEST, "Invalid path");
     };
 
     if !canonical_path.is_dir() {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Path is not a directory"}))).into_response();
+        return json_error(StatusCode::BAD_REQUEST, "Path is not a directory");
     }
 
     let workspace_id = generate_workspace_id(&canonical_path);
@@ -342,11 +365,10 @@ async fn api_unregister(
     let mut inner = state.inner.write().await;
 
     if let Some(workspace) = inner.workspaces.remove(&workspace_id) {
-        // Drop the watcher handle to stop the file watcher thread
         drop(workspace.watcher_handle);
         Json(serde_json::json!({"status": "ok", "id": workspace_id})).into_response()
     } else {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Workspace not found"}))).into_response()
+        json_error(StatusCode::NOT_FOUND, "Workspace not found")
     }
 }
 
@@ -357,35 +379,30 @@ async fn api_active(
 ) -> Response {
     let abs_path = PathBuf::from(&query.path);
     let Ok(canonical_path) = abs_path.canonicalize() else {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Invalid path"}))).into_response();
+        return json_error(StatusCode::BAD_REQUEST, "Invalid path");
     };
 
     let inner = state.inner.read().await;
 
-    for (id, workspace) in &inner.workspaces {
-        if let Ok(workspace_canonical) = workspace.root_dir.canonicalize() {
-            if canonical_path.starts_with(&workspace_canonical) {
-                let relative = canonical_path
-                    .strip_prefix(&workspace_canonical)
-                    .unwrap_or(&canonical_path);
-                let relative_str = relative.to_string_lossy();
-                let url = format!("/view/{}/{}", id, relative_str);
+    let Some((workspace_id, relative_path)) =
+        find_workspace_for_path(&inner.workspaces, &canonical_path)
+    else {
+        return json_error(StatusCode::NOT_FOUND, "File not in any registered workspace");
+    };
 
-                let _ = state.ws_tx.send(WsCommand::Focus {
-                    workspace_id: id.clone(),
-                    file_path: relative_str.to_string(),
-                });
-                let _ = state.ws_tx.send(WsCommand::Navigate { url: url.clone() });
+    let url = format!("/view/{}/{}", workspace_id, relative_path);
 
-                return Json(serde_json::json!({
-                    "url": url,
-                    "workspace_id": id,
-                })).into_response();
-            }
-        }
-    }
+    let _ = state.ws_tx.send(WsCommand::Focus {
+        workspace_id: workspace_id.to_string(),
+        file_path: relative_path.clone(),
+    });
+    let _ = state.ws_tx.send(WsCommand::Navigate { url: url.clone() });
 
-    (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "File not in any registered workspace"}))).into_response()
+    Json(serde_json::json!({
+        "url": url,
+        "workspace_id": workspace_id,
+    }))
+    .into_response()
 }
 
 // API: Status check
@@ -778,4 +795,200 @@ async fn main() {
     println!("mdv server listening at http://{}", addr);
 
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, File};
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_format_file_size_bytes() {
+        assert_eq!(format_file_size(0), "0 B");
+        assert_eq!(format_file_size(512), "512 B");
+        assert_eq!(format_file_size(1023), "1023 B");
+    }
+
+    #[test]
+    fn test_format_file_size_kilobytes() {
+        assert_eq!(format_file_size(1024), "1.0 KB");
+        assert_eq!(format_file_size(1536), "1.5 KB");
+        assert_eq!(format_file_size(1024 * 1023), "1023.0 KB");
+    }
+
+    #[test]
+    fn test_format_file_size_megabytes() {
+        assert_eq!(format_file_size(1024 * 1024), "1.0 MB");
+        assert_eq!(format_file_size(1024 * 1024 * 500), "500.0 MB");
+    }
+
+    #[test]
+    fn test_format_file_size_gigabytes() {
+        assert_eq!(format_file_size(1024 * 1024 * 1024), "1.0 GB");
+        assert_eq!(format_file_size(1024 * 1024 * 1024 * 2), "2.0 GB");
+    }
+
+    #[test]
+    fn test_generate_workspace_id_format() {
+        let path = PathBuf::from("/home/user/project");
+        let id = generate_workspace_id(&path);
+        assert!(id.starts_with("project-"));
+        assert!(id.len() > 8); // "project-" + hash
+    }
+
+    #[test]
+    fn test_generate_workspace_id_deterministic() {
+        let path = PathBuf::from("/home/user/project");
+        let id1 = generate_workspace_id(&path);
+        let id2 = generate_workspace_id(&path);
+        assert_eq!(id1, id2);
+    }
+
+    #[test]
+    fn test_generate_workspace_id_different_paths() {
+        let path1 = PathBuf::from("/home/user/project1");
+        let path2 = PathBuf::from("/home/user/project2");
+        let id1 = generate_workspace_id(&path1);
+        let id2 = generate_workspace_id(&path2);
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_generate_breadcrumbs_root() {
+        let crumbs = generate_breadcrumbs("ws-123", "myproject", "");
+        assert_eq!(crumbs.len(), 2);
+        assert_eq!(crumbs[0].name, "root");
+        assert_eq!(crumbs[1].name, "myproject");
+        assert!(crumbs[1].is_last);
+    }
+
+    #[test]
+    fn test_generate_breadcrumbs_nested_path() {
+        let crumbs = generate_breadcrumbs("ws-123", "myproject", "docs/api/readme.md");
+        assert_eq!(crumbs.len(), 5);
+        assert_eq!(crumbs[0].name, "root");
+        assert_eq!(crumbs[1].name, "myproject");
+        assert_eq!(crumbs[2].name, "docs");
+        assert_eq!(crumbs[3].name, "api");
+        assert_eq!(crumbs[4].name, "readme.md");
+        assert!(crumbs[4].is_last);
+        assert!(!crumbs[3].is_last);
+    }
+
+    #[test]
+    fn test_render_markdown_basic() {
+        let md = "# Hello\n\nWorld";
+        let html = render_markdown(md);
+        assert!(html.contains("<h1>"));
+        assert!(html.contains("Hello"));
+        assert!(html.contains("<p>"));
+    }
+
+    #[test]
+    fn test_render_markdown_table() {
+        let md = "| A | B |\n|---|---|\n| 1 | 2 |";
+        let html = render_markdown(md);
+        assert!(html.contains("<table>"));
+        assert!(html.contains("<th>"));
+    }
+
+    #[test]
+    fn test_render_markdown_strikethrough() {
+        let md = "~~deleted~~";
+        let html = render_markdown(md);
+        assert!(html.contains("<del>"));
+    }
+
+    #[test]
+    fn test_render_markdown_tasklist() {
+        let md = "- [x] done\n- [ ] todo";
+        let html = render_markdown(md);
+        assert!(html.contains("checked"));
+        assert!(html.contains("checkbox"));
+    }
+
+    #[test]
+    fn test_validate_path_valid() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().to_path_buf();
+        let subdir = root.join("subdir");
+        fs::create_dir(&subdir).unwrap();
+        File::create(subdir.join("file.md")).unwrap();
+
+        let result = validate_path(&root, "subdir/file.md");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_validate_path_traversal_attack() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().to_path_buf();
+
+        let result = validate_path(&root, "../../../etc/passwd");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_validate_path_nonexistent() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().to_path_buf();
+
+        let result = validate_path(&root, "nonexistent.md");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_contains_markdown_file() {
+        let temp = TempDir::new().unwrap();
+        let md_file = temp.path().join("test.md");
+        File::create(&md_file).unwrap();
+
+        assert!(contains_markdown(&md_file));
+    }
+
+    #[test]
+    fn test_contains_markdown_non_md_file() {
+        let temp = TempDir::new().unwrap();
+        let txt_file = temp.path().join("test.txt");
+        File::create(&txt_file).unwrap();
+
+        assert!(!contains_markdown(&txt_file));
+    }
+
+    #[test]
+    fn test_contains_markdown_dir_with_md() {
+        let temp = TempDir::new().unwrap();
+        File::create(temp.path().join("readme.md")).unwrap();
+
+        assert!(contains_markdown(&temp.path().to_path_buf()));
+    }
+
+    #[test]
+    fn test_contains_markdown_dir_without_md() {
+        let temp = TempDir::new().unwrap();
+        File::create(temp.path().join("readme.txt")).unwrap();
+
+        assert!(!contains_markdown(&temp.path().to_path_buf()));
+    }
+
+    #[test]
+    fn test_contains_markdown_nested() {
+        let temp = TempDir::new().unwrap();
+        let subdir = temp.path().join("docs");
+        fs::create_dir(&subdir).unwrap();
+        File::create(subdir.join("readme.md")).unwrap();
+
+        assert!(contains_markdown(&temp.path().to_path_buf()));
+    }
+
+    #[test]
+    fn test_contains_markdown_ignores_hidden() {
+        let temp = TempDir::new().unwrap();
+        let hidden = temp.path().join(".hidden");
+        fs::create_dir(&hidden).unwrap();
+        File::create(hidden.join("secret.md")).unwrap();
+
+        assert!(!contains_markdown(&temp.path().to_path_buf()));
+    }
 }

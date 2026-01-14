@@ -3,6 +3,9 @@ name = "mdv"
 version = "0.1.0"
 edition = "2021"
 
+[dev-dependencies]
+tempfile = "3"
+
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 serde = { version = "1", features = ["derive"] }

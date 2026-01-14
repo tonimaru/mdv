@@ -164,6 +164,59 @@ function! s:find_workspace_for_file(path) abort
   return {}
 endfunction
 
+" Check if current buffer is a valid markdown file in a registered workspace.
+" Returns workspace info dict if valid, empty dict otherwise.
+" Refreshes cache if empty.
+function! s:get_current_md_workspace() abort
+  let l:path = expand('%:p')
+  if l:path !~# '\.md$'
+    return {}
+  endif
+
+  if !filereadable(l:path)
+    return {}
+  endif
+
+  if empty(s:workspace_cache)
+    call s:refresh_workspace_cache()
+  endif
+
+  return s:find_workspace_for_file(l:path)
+endfunction
+
+" Execute curl GET request and return parsed JSON response.
+" Returns empty dict on error.
+function! s:curl_get(url) abort
+  let l:result = system('curl -s --max-time 1 ' . shellescape(a:url))
+  try
+    return json_decode(l:result)
+  catch
+    return {}
+  endtry
+endfunction
+
+" Execute curl POST request with JSON body.
+" Returns parsed JSON response or empty dict on error.
+function! s:curl_post(url, json_body) abort
+  let l:result = system('curl -s -X POST -H "Content-Type: application/json" -d ' . shellescape(a:json_body) . ' ' . shellescape(a:url))
+  try
+    return json_decode(l:result)
+  catch
+    return {}
+  endtry
+endfunction
+
+" Execute curl DELETE request.
+" Returns parsed JSON response or empty dict on error.
+function! s:curl_delete(url) abort
+  let l:result = system('curl -s -X DELETE ' . shellescape(a:url))
+  try
+    return json_decode(l:result)
+  catch
+    return {}
+  endtry
+endfunction
+
 " Register workspace with server
 function! mdv#register_workspace(...) abort
   if !s:ensure_server()
@@ -172,25 +225,19 @@ function! mdv#register_workspace(...) abort
 
   let l:root = a:0 > 0 ? a:1 : s:get_project_root()
 
-  " Skip if already registered
   if has_key(s:registered_workspaces, l:root)
     return s:registered_workspaces[l:root]
   endif
 
   let l:url = s:base_url() . '/api/workspace/register'
   let l:json = '{"path":"' . escape(l:root, '"') . '"}'
+  let l:resp = s:curl_post(l:url, l:json)
 
-  let l:result = system('curl -s -X POST -H "Content-Type: application/json" -d ' . shellescape(l:json) . ' ' . shellescape(l:url))
-
-  try
-    let l:resp = json_decode(l:result)
-    if has_key(l:resp, 'id')
-      let s:registered_workspaces[l:root] = l:resp
-      call s:refresh_workspace_cache()
-      return l:resp
-    endif
-  catch
-  endtry
+  if has_key(l:resp, 'id')
+    let s:registered_workspaces[l:root] = l:resp
+    call s:refresh_workspace_cache()
+    return l:resp
+  endif
 
   return ''
 endfunction
@@ -201,38 +248,18 @@ function! mdv#active() abort
     return
   endif
 
-  let l:path = expand('%:p')
-  if l:path !~# '\.md$'
-    return
-  endif
-
-  " Skip if file does not exist
-  if !filereadable(l:path)
-    return
-  endif
-
-  " Refresh cache if empty
-  if empty(s:workspace_cache)
-    call s:refresh_workspace_cache()
-  endif
-
-  " Only process files within registered workspaces
-  let l:ws = s:find_workspace_for_file(l:path)
+  let l:ws = s:get_current_md_workspace()
   if empty(l:ws)
     return
   endif
 
-  let l:url = s:base_url() . '/api/active?path=' . l:path
-  let l:result = system('curl -s --max-time 1 ' . shellescape(l:url))
+  let l:url = s:base_url() . '/api/active?path=' . expand('%:p')
+  let l:resp = s:curl_get(l:url)
 
   " Clear cache on error (workspace may have been removed externally)
-  try
-    let l:resp = json_decode(l:result)
-    if has_key(l:resp, 'error')
-      call s:clear_workspace_cache()
-    endif
-  catch
-  endtry
+  if has_key(l:resp, 'error')
+    call s:clear_workspace_cache()
+  endif
 endfunction
 
 " Open current file in browser
@@ -280,31 +307,11 @@ endfunction
 
 " Sync scroll position (only for registered workspaces)
 function! mdv#sync_scroll() abort
-  if !g:mdv_sync_scroll
+  if !g:mdv_sync_scroll || !mdv#is_running()
     return
   endif
 
-  if !mdv#is_running()
-    return
-  endif
-
-  let l:path = expand('%:p')
-  if l:path !~# '\.md$'
-    return
-  endif
-
-  " Skip if file does not exist
-  if !filereadable(l:path)
-    return
-  endif
-
-  " Refresh cache if empty
-  if empty(s:workspace_cache)
-    call s:refresh_workspace_cache()
-  endif
-
-  " Only process files within registered workspaces
-  let l:ws = s:find_workspace_for_file(l:path)
+  let l:ws = s:get_current_md_workspace()
   if empty(l:ws)
     return
   endif
@@ -334,36 +341,21 @@ function! mdv#status() abort
     return
   endif
 
-  let l:url = s:base_url() . '/api/status'
-  let l:result = system('curl -s ' . shellescape(l:url))
+  let l:resp = s:curl_get(s:base_url() . '/api/status')
+  echo 'mdv server running at ' . s:base_url()
+  echo 'Scroll sync: ' . (g:mdv_sync_scroll ? 'ON' : 'OFF')
 
-  try
-    let l:resp = json_decode(l:result)
+  if has_key(l:resp, 'workspaces')
     let s:workspace_cache = l:resp.workspaces
-    echo 'mdv server running at ' . s:base_url()
-    echo 'Scroll sync: ' . (g:mdv_sync_scroll ? 'ON' : 'OFF')
     echo 'Workspaces:'
     for l:ws in l:resp.workspaces
       echo '  - ' . l:ws.name . ' (' . l:ws.path . ')'
     endfor
-  catch
-    echo 'mdv server running at ' . s:base_url()
-  endtry
+  endif
 endfunction
 
 " Sync browser on BufEnter for .md files (only for registered workspaces)
 function! mdv#on_buf_enter() abort
-  let l:path = expand('%:p')
-  if l:path !~# '\.md$'
-    return
-  endif
-
-  " Skip if file does not exist
-  if !filereadable(l:path)
-    return
-  endif
-
-  " mdv#active() only processes files within registered workspaces
   call mdv#active()
 endfunction
 
@@ -374,8 +366,6 @@ function! mdv#workspace_add(...) abort
   endif
 
   let l:path = a:0 > 0 ? a:1 : s:get_project_root()
-
-  " Expand path
   let l:path = fnamemodify(l:path, ':p')
   if l:path[-1:] ==# '/'
     let l:path = l:path[:-2]
@@ -383,21 +373,49 @@ function! mdv#workspace_add(...) abort
 
   let l:url = s:base_url() . '/api/workspace/register'
   let l:json = '{"path":"' . escape(l:path, '"') . '"}'
+  let l:resp = s:curl_post(l:url, l:json)
 
-  let l:result = system('curl -s -X POST -H "Content-Type: application/json" -d ' . shellescape(l:json) . ' ' . shellescape(l:url))
-
-  try
-    let l:resp = json_decode(l:result)
-    if has_key(l:resp, 'id')
-      let s:registered_workspaces[l:path] = l:resp
-      call s:refresh_workspace_cache()
-      echo 'Workspace added: ' . l:resp.name . ' (' . l:resp.id . ')'
-    elseif has_key(l:resp, 'error')
-      echoerr 'Error: ' . l:resp.error
-    endif
-  catch
+  if empty(l:resp)
     echoerr 'Failed to add workspace'
-  endtry
+  elseif has_key(l:resp, 'id')
+    let s:registered_workspaces[l:path] = l:resp
+    call s:refresh_workspace_cache()
+    echo 'Workspace added: ' . l:resp.name . ' (' . l:resp.id . ')'
+  elseif has_key(l:resp, 'error')
+    echoerr 'Error: ' . l:resp.error
+  endif
+endfunction
+
+" Prompt user to select a workspace from list.
+" Returns workspace id or empty string if cancelled.
+function! s:select_workspace(workspaces) abort
+  let l:choices = []
+  let l:idx = 1
+  for l:ws in a:workspaces
+    call add(l:choices, l:idx . '. ' . l:ws.name . ' (' . l:ws.id . ') - ' . l:ws.path)
+    let l:idx += 1
+  endfor
+
+  echo 'Select workspace to remove:'
+  for l:choice in l:choices
+    echo l:choice
+  endfor
+
+  let l:input = input('Enter number (or workspace id): ')
+  if empty(l:input)
+    return ''
+  endif
+
+  if l:input =~# '^\d\+$'
+    let l:num = str2nr(l:input)
+    if l:num >= 1 && l:num <= len(a:workspaces)
+      return a:workspaces[l:num - 1].id
+    endif
+    echoerr 'Invalid selection'
+    return ''
+  endif
+
+  return l:input
 endfunction
 
 " Remove workspace (unregister from server)
@@ -407,73 +425,31 @@ function! mdv#workspace_remove(...) abort
     return
   endif
 
-  " Get workspace list
-  let l:status_url = s:base_url() . '/api/status'
-  let l:result = system('curl -s ' . shellescape(l:status_url))
+  let l:resp = s:curl_get(s:base_url() . '/api/status')
+  if empty(l:resp) || empty(get(l:resp, 'workspaces', []))
+    echo 'No workspaces registered'
+    return
+  endif
 
-  try
-    let l:resp = json_decode(l:result)
-    if empty(l:resp.workspaces)
-      echo 'No workspaces registered'
-      return
-    endif
+  let l:workspace_id = a:0 > 0 ? a:1 : s:select_workspace(l:resp.workspaces)
+  if empty(l:workspace_id)
+    return
+  endif
 
-    let l:workspace_id = ''
+  let l:del_resp = s:curl_delete(s:base_url() . '/api/workspace/' . l:workspace_id)
 
-    if a:0 > 0
-      " Use provided workspace id
-      let l:workspace_id = a:1
-    else
-      " Show list and let user choose
-      let l:choices = []
-      let l:idx = 1
-      for l:ws in l:resp.workspaces
-        call add(l:choices, l:idx . '. ' . l:ws.name . ' (' . l:ws.id . ') - ' . l:ws.path)
-        let l:idx += 1
-      endfor
-
-      echo 'Select workspace to remove:'
-      for l:choice in l:choices
-        echo l:choice
-      endfor
-
-      let l:input = input('Enter number (or workspace id): ')
-      if empty(l:input)
-        return
-      endif
-
-      if l:input =~# '^\d\+$'
-        let l:num = str2nr(l:input)
-        if l:num >= 1 && l:num <= len(l:resp.workspaces)
-          let l:workspace_id = l:resp.workspaces[l:num - 1].id
-        else
-          echoerr 'Invalid selection'
-          return
-        endif
-      else
-        let l:workspace_id = l:input
-      endif
-    endif
-
-    " Delete workspace
-    let l:delete_url = s:base_url() . '/api/workspace/' . l:workspace_id
-    let l:del_result = system('curl -s -X DELETE ' . shellescape(l:delete_url))
-
-    let l:del_resp = json_decode(l:del_result)
-    if has_key(l:del_resp, 'status') && l:del_resp.status ==# 'ok'
-      " Remove from local cache
-      for [l:path, l:ws] in items(s:registered_workspaces)
-        if l:ws.id ==# l:workspace_id
-          call remove(s:registered_workspaces, l:path)
-          break
-        endif
-      endfor
-      call s:refresh_workspace_cache()
-      echo 'Workspace removed: ' . l:workspace_id
-    elseif has_key(l:del_resp, 'error')
-      echoerr 'Error: ' . l:del_resp.error
-    endif
-  catch
+  if empty(l:del_resp)
     echoerr 'Failed to remove workspace'
-  endtry
+  elseif has_key(l:del_resp, 'status') && l:del_resp.status ==# 'ok'
+    for [l:path, l:ws] in items(s:registered_workspaces)
+      if l:ws.id ==# l:workspace_id
+        call remove(s:registered_workspaces, l:path)
+        break
+      endif
+    endfor
+    call s:refresh_workspace_cache()
+    echo 'Workspace removed: ' . l:workspace_id
+  elseif has_key(l:del_resp, 'error')
+    echoerr 'Error: ' . l:del_resp.error
+  endif
 endfunction
